@@ -5,12 +5,12 @@ It writes a solution, runs pytest, reads failures, fixes, and repeats
 until tests pass or the iteration / cost budget is exhausted.
 """
 
-import os
-import json
+import ast
+import re
+import time
 from dataclasses import dataclass, field
-from typing import Optional
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import OpenAI, APIError, RateLimitError, APITimeoutError
 
 from sandbox import run_pytest
 
@@ -60,17 +60,52 @@ class AgentRun:
 COST_PER_INPUT_TOKEN = 0.15 / 1_000_000
 COST_PER_OUTPUT_TOKEN = 0.60 / 1_000_000
 
+# Matches ```python ... ``` or bare ``` ... ``` fences the model emits despite
+# being told not to. We strip them so the sandbox sees runnable source.
+_FENCE_RE = re.compile(r"^\s*```(?:python|py)?\s*\n(.*?)\n\s*```\s*$", re.DOTALL)
 
-def _chat(messages: list[dict], model: str = "gpt-4o-mini") -> tuple[str, int, int]:
-    response = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=0.2,
-    )
-    content = response.choices[0].message.content or ""
-    in_tok = response.usage.prompt_tokens
-    out_tok = response.usage.completion_tokens
-    return content, in_tok, out_tok
+
+def strip_code_fences(text: str) -> str:
+    """Remove a surrounding markdown code fence if the model added one."""
+    m = _FENCE_RE.match(text.strip())
+    return m.group(1) if m else text.strip()
+
+
+def is_valid_python(source: str) -> bool:
+    """Cheap pre-check so we don't waste a pytest run on un-parseable code."""
+    try:
+        ast.parse(source)
+        return True
+    except SyntaxError:
+        return False
+
+
+def _chat(
+    messages: list[dict],
+    model: str = "gpt-4o-mini",
+    max_retries: int = 3,
+) -> tuple[str, int, int]:
+    """Call the model, stripping fences and retrying transient API errors."""
+    last_err: Exception | None = None
+    for attempt in range(max_retries):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=0.2,
+            )
+            content = strip_code_fences(response.choices[0].message.content or "")
+            usage = response.usage
+            in_tok = usage.prompt_tokens if usage else 0
+            out_tok = usage.completion_tokens if usage else 0
+            return content, in_tok, out_tok
+        except (RateLimitError, APITimeoutError, APIError) as e:
+            last_err = e
+            if attempt < max_retries - 1:
+                wait = 2 ** attempt  # 1s, 2s, 4s exponential backoff
+                print(f"[retry] API error ({type(e).__name__}); waiting {wait}s…")
+                time.sleep(wait)
+    raise RuntimeError(f"LLM call failed after {max_retries} attempts: {last_err}")
 
 
 def run_code_agent(
@@ -114,16 +149,24 @@ def run_code_agent(
 
     # --- Step 2: test → fix loop ---
     for iteration in range(2, max_iterations + 1):
-        result = run_pytest(tests, run.solution)
+        # Don't pay for a pytest run on un-parseable code — feed the syntax
+        # error straight back as the failure output.
+        if not is_valid_python(run.solution):
+            pytest_like = "SyntaxError: the previous solution does not parse as valid Python."
+            if verbose:
+                print(f"[iter {run.iterations}] solution has a syntax error — skipping pytest")
+        else:
+            result = run_pytest(tests, run.solution)
+            pytest_like = result.stdout[-1500:] + result.stderr[-500:]
 
-        if verbose:
-            print(f"[iter {run.iterations}] pytest → {'PASS' if result.success else 'FAIL'}")
-            if not result.success:
-                print(result.stdout[-800:])
+            if verbose:
+                print(f"[iter {run.iterations}] pytest → {'PASS' if result.success else 'FAIL'}")
+                if not result.success:
+                    print(result.stdout[-800:])
 
-        if result.success:
-            run.passed = True
-            break
+            if result.success:
+                run.passed = True
+                break
 
         if run.total_cost_usd >= max_cost_usd:
             if verbose:
@@ -131,7 +174,7 @@ def run_code_agent(
             break
 
         fix_prompt = FIX_PROMPT.format(
-            pytest_output=result.stdout[-1500:] + result.stderr[-500:],
+            pytest_output=pytest_like,
             current_solution=run.solution,
         )
         messages = [

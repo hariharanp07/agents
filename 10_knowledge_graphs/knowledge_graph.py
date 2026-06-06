@@ -7,10 +7,11 @@ No external database required.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
-from typing import Any, Optional
+import re
+import time
+from typing import Optional
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import OpenAI, APIError, RateLimitError, APITimeoutError
 from pydantic import BaseModel
 
 load_dotenv(override=True)
@@ -56,17 +57,54 @@ Text:
 {text}"""
 
 
-def extract_triples(text: str) -> list[Triple]:
-    """Extract knowledge graph triples from text using an LLM."""
-    response = client.beta.chat.completions.parse(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": "You extract structured knowledge from text. Be precise."},
-            {"role": "user", "content": EXTRACT_PROMPT.format(text=text)},
-        ],
-        response_format=TripleList,
-    )
-    return response.choices[0].message.parsed.triples
+def extract_triples(text: str, max_retries: int = 3) -> list[Triple]:
+    """
+    Extract knowledge graph triples from text using an LLM.
+
+    Robustness: validates input, retries transient API errors with backoff, and
+    returns [] rather than raising on an empty/garbage parse.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return []
+
+    last_err: Exception | None = None
+    for attempt in range(max_retries):
+        try:
+            response = client.beta.chat.completions.parse(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "You extract structured knowledge from text. Be precise."},
+                    {"role": "user", "content": EXTRACT_PROMPT.format(text=text)},
+                ],
+                response_format=TripleList,
+            )
+            parsed = response.choices[0].message.parsed
+            return parsed.triples if parsed else []
+        except (RateLimitError, APITimeoutError, APIError) as e:
+            last_err = e
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+    raise RuntimeError(f"Triple extraction failed after {max_retries} attempts: {last_err}")
+
+
+# ---------------------------------------------------------------------------
+# Entity resolution
+# ---------------------------------------------------------------------------
+
+def canonicalize_entity(name: str) -> str:
+    """
+    Normalise an entity surface form so 'Elon Musk', 'elon  musk', and
+    'Elon Musk.' collapse to one canonical key.
+
+    This is deliberately conservative (casing/whitespace/punctuation only). It
+    will NOT merge 'Musk' with 'Elon Musk' — that needs the alias map below,
+    because blindly merging on substrings is unsafe ('Apple' vs 'Apple Inc').
+    """
+    if not isinstance(name, str):
+        return str(name)
+    cleaned = re.sub(r"[.’']", "", name)        # drop trailing dots / apostrophes
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned.title() if cleaned.islower() or cleaned.isupper() else cleaned
 
 
 # ---------------------------------------------------------------------------
@@ -76,16 +114,32 @@ def extract_triples(text: str) -> list[Triple]:
 class KnowledgeGraph:
     """In-memory directed knowledge graph backed by NetworkX."""
 
-    def __init__(self):
+    def __init__(self, resolve_entities: bool = True):
         if not NX_AVAILABLE:
             raise ImportError("networkx required: pip install networkx")
         self.graph: nx.MultiDiGraph = nx.MultiDiGraph()
         self.triple_count = 0
+        self.resolve_entities = resolve_entities
+        # Optional manual aliases, e.g. {"Musk": "Elon Musk"}. Applied after
+        # canonicalisation so you can merge surface forms canonicalisation can't.
+        self.aliases: dict[str, str] = {}
+
+    def add_alias(self, alias: str, canonical: str) -> None:
+        """Register that `alias` refers to the same entity as `canonical`."""
+        self.aliases[self._norm(alias)] = canonical
+
+    def _norm(self, name: str) -> str:
+        return canonicalize_entity(name) if self.resolve_entities else name
+
+    def _resolve(self, name: str) -> str:
+        """Canonicalise then apply the alias map."""
+        key = self._norm(name)
+        return self.aliases.get(key, key)
 
     def add_triple(self, triple: Triple):
         self.graph.add_edge(
-            triple.subject,
-            triple.obj,
+            self._resolve(triple.subject),
+            self._resolve(triple.obj),
             predicate=triple.predicate,
             confidence=triple.confidence,
         )
@@ -106,7 +160,15 @@ class KnowledgeGraph:
         direction='out': entities this entity points to
         direction='in':  entities that point to this entity
         direction='both': both
+
+        The query entity is resolved through canonicalisation + aliases, so
+        `neighbors('musk')` finds the same node as `neighbors('Elon Musk')`.
         """
+        if direction not in ("out", "in", "both"):
+            raise ValueError("direction must be 'out', 'in', or 'both'")
+        entity = self._resolve(entity)
+        if entity not in self.graph:
+            return []
         results = []
         if direction in ("out", "both"):
             for _, target, data in self.graph.out_edges(entity, data=True):
@@ -117,9 +179,9 @@ class KnowledgeGraph:
         return results
 
     def shortest_path(self, source: str, target: str) -> Optional[list[str]]:
-        """Find shortest path between two entities."""
+        """Find shortest path between two entities (both resolved first)."""
         try:
-            return nx.shortest_path(self.graph, source, target)
+            return nx.shortest_path(self.graph, self._resolve(source), self._resolve(target))
         except (nx.NetworkXNoPath, nx.NodeNotFound):
             return None
 
@@ -137,10 +199,12 @@ class KnowledgeGraph:
         Example: multi_hop_query('Alice', ['works_at', 'located_in'])
         → Find where Alice works, then find where that company is located.
         """
-        current_entities = {start}
+        current_entities = {self._resolve(start)}
         for predicate in hops:
             next_entities = set()
             for entity in current_entities:
+                if entity not in self.graph:
+                    continue
                 for _, target, data in self.graph.out_edges(entity, data=True):
                     if data.get("predicate") == predicate:
                         next_entities.add(target)
@@ -149,13 +213,54 @@ class KnowledgeGraph:
                 break
         return list(current_entities)
 
-    def answer_question(self, question: str) -> str:
-        """Use LLM to answer a question by providing the relevant graph context."""
-        # Dump the graph as triples for context
-        triples_text = "\n".join(
-            f"({s}) --[{data['predicate']}]--> ({o})"
-            for s, o, data in self.graph.edges(data=True)
-        )
+    def relevant_subgraph(self, entities: list[str], radius: int = 2) -> list[tuple[str, str, str]]:
+        """
+        Return the edges within `radius` hops of any of `entities` (in either
+        direction). This is how `answer_question` stays scalable: instead of
+        serialising the whole graph into the prompt, we serialise only the
+        neighbourhood around the question's entities.
+        """
+        seeds = {self._resolve(e) for e in entities if self._resolve(e) in self.graph}
+        if not seeds:
+            return []
+        undirected = self.graph.to_undirected(as_view=True)
+        keep: set[str] = set()
+        for seed in seeds:
+            # ego_graph = all nodes within `radius` hops of the seed
+            keep |= set(nx.ego_graph(undirected, seed, radius=radius).nodes())
+        return [
+            (s, d["predicate"], o)
+            for s, o, d in self.graph.edges(data=True)
+            if s in keep and o in keep
+        ]
+
+    def _mentioned_entities(self, question: str) -> list[str]:
+        """Cheap string match: which graph nodes are named in the question?"""
+        q = question.lower()
+        return [n for n in self.graph.nodes() if str(n).lower() in q]
+
+    def answer_question(self, question: str, radius: int = 2, max_edges: int = 200) -> str:
+        """
+        Answer a question grounded ONLY in the graph.
+
+        Scalability: if the question names entities in the graph, we send just
+        their `radius`-hop subgraph; otherwise we fall back to the whole graph
+        but cap the number of edges so we never blow the context window.
+        """
+        if not isinstance(question, str) or not question.strip():
+            return "Not found in graph."
+
+        mentioned = self._mentioned_entities(question)
+        if mentioned:
+            edges = self.relevant_subgraph(mentioned, radius=radius)
+        else:
+            edges = [(s, d["predicate"], o) for s, o, d in self.graph.edges(data=True)]
+
+        if not edges:
+            return "Not found in graph."
+        edges = edges[:max_edges]
+        triples_text = "\n".join(f"({s}) --[{p}]--> ({o})" for s, p, o in edges)
+
         prompt = f"""Answer the question using ONLY the knowledge graph provided.
 If the answer cannot be found in the graph, say 'Not found in graph.'
 

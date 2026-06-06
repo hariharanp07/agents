@@ -10,10 +10,12 @@ Core abstractions:
 from __future__ import annotations
 
 import asyncio
+import queue
+import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 
 class Decision(Enum):
@@ -31,6 +33,15 @@ class Step:
     confidence: float = 1.0          # 0.0–1.0; below threshold triggers escalation
     requires_approval: bool = True
     cost_estimate_usd: float = 0.0
+
+    def __post_init__(self):
+        if not self.name:
+            raise ValueError("Step.name must be non-empty")
+        # Clamp rather than reject — a slightly out-of-range model score should
+        # not crash a workflow; it should just saturate.
+        self.confidence = max(0.0, min(1.0, float(self.confidence)))
+        if self.cost_estimate_usd < 0:
+            raise ValueError("Step.cost_estimate_usd cannot be negative")
 
 
 @dataclass
@@ -66,6 +77,32 @@ class FeedbackStore:
         return "\n".join(lines)
 
 
+def _timed_input(prompt: str, timeout_seconds: float) -> Optional[str]:
+    """
+    Read a line from stdin but give up after `timeout_seconds`.
+
+    Returns the entered string, or None if the human didn't respond in time.
+    Uses a daemon thread so it works cross-platform (unlike signal.alarm, which
+    is POSIX-only). The thread can't be force-killed, but it's a daemon, so it
+    won't block process exit.
+    """
+    result_q: "queue.Queue[str]" = queue.Queue(maxsize=1)
+
+    def _reader():
+        try:
+            result_q.put(input(prompt))
+        except (EOFError, KeyboardInterrupt):
+            pass  # leave the queue empty → treated as timeout/no-response
+
+    t = threading.Thread(target=_reader, daemon=True)
+    t.start()
+    t.join(timeout_seconds)
+    try:
+        return result_q.get_nowait()
+    except queue.Empty:
+        return None
+
+
 class ApprovalGate:
     """
     Checkpoint that pauses execution and waits for human input.
@@ -74,6 +111,10 @@ class ApprovalGate:
       - 'cli'     : prompts in the terminal (default, works everywhere)
       - 'auto'    : automatically approves (useful for testing)
       - 'callback': calls a provided function(step) → ApprovalResult
+
+    The CLI backend honours `timeout_seconds`: if the human doesn't answer in
+    time the gate returns Decision.TIMEOUT (fail safe) instead of blocking
+    forever.
     """
 
     def __init__(
@@ -102,6 +143,9 @@ class ApprovalGate:
 
     def request(self, step: Step) -> ApprovalResult:
         """Synchronously request approval for a step."""
+        if not isinstance(step, Step):
+            raise TypeError(f"request() expects a Step, got {type(step).__name__}")
+
         if not self.needs_human(step):
             return ApprovalResult(Decision.APPROVE, feedback="auto-approved (thresholds not triggered)")
 
@@ -110,15 +154,27 @@ class ApprovalGate:
         if self.backend == "auto":
             return ApprovalResult(Decision.APPROVE, feedback="auto-approved (test mode)")
 
-        if self.backend == "callback" and self.callback:
+        if self.backend == "callback":
+            if not self.callback:
+                raise ValueError("backend='callback' requires a callback function")
             result = self.callback(step)
+            if not isinstance(result, ApprovalResult):
+                raise TypeError("callback must return an ApprovalResult")
             result.elapsed_seconds = time.monotonic() - start
             return result
 
         # CLI backend
         return self._cli_prompt(step, start)
 
-    def _cli_prompt(self, step: Step, start: float) -> ApprovalResult:
+    async def request_async(self, step: Step) -> ApprovalResult:
+        """
+        Async approval — for use inside an event loop (e.g. a web/Gradio handler
+        or alongside Week 8's asyncio code). Runs the blocking CLI/callback path
+        in a worker thread so it never stalls the loop.
+        """
+        return await asyncio.to_thread(self.request, step)
+
+    def _render_step(self, step: Step) -> None:
         print("\n" + "=" * 60)
         print(f"⏸  APPROVAL REQUIRED: {step.name}")
         print(f"   {step.description}")
@@ -128,24 +184,31 @@ class ApprovalGate:
             print(f"   Estimated cost: ${step.cost_estimate_usd:.4f}")
         print("=" * 60)
         print("[a] Approve  [r] Reject  [e] Escalate  [f] Approve with feedback")
-        try:
-            choice = input("Decision: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            return ApprovalResult(Decision.TIMEOUT, elapsed_seconds=time.monotonic() - start)
+        print(f"   (auto-timeout in {self.timeout_seconds:.0f}s → TIMEOUT)")
 
+    def _cli_prompt(self, step: Step, start: float) -> ApprovalResult:
+        self._render_step(step)
+
+        raw = _timed_input("Decision: ", self.timeout_seconds)
         elapsed = time.monotonic() - start
+
+        if raw is None:
+            print("\n⏱  No response in time — defaulting to TIMEOUT (fail safe).")
+            return ApprovalResult(Decision.TIMEOUT, elapsed_seconds=elapsed)
+
+        choice = raw.strip().lower()
         if choice == "a":
             return ApprovalResult(Decision.APPROVE, elapsed_seconds=elapsed)
         elif choice == "r":
-            reason = input("Reason for rejection: ").strip()
-            return ApprovalResult(Decision.REJECT, feedback=reason, elapsed_seconds=elapsed)
+            reason = _timed_input("Reason for rejection: ", self.timeout_seconds) or ""
+            return ApprovalResult(Decision.REJECT, feedback=reason.strip(), elapsed_seconds=elapsed)
         elif choice == "e":
             return ApprovalResult(Decision.ESCALATE, elapsed_seconds=elapsed)
         elif choice == "f":
-            feedback = input("Feedback (agent will incorporate): ").strip()
-            return ApprovalResult(Decision.APPROVE, feedback=feedback, elapsed_seconds=elapsed)
+            feedback = _timed_input("Feedback (agent will incorporate): ", self.timeout_seconds) or ""
+            return ApprovalResult(Decision.APPROVE, feedback=feedback.strip(), elapsed_seconds=elapsed)
         else:
-            print("Unknown choice — defaulting to ESCALATE")
+            print("Unknown choice — defaulting to ESCALATE (fail safe).")
             return ApprovalResult(Decision.ESCALATE, elapsed_seconds=elapsed)
 
 
@@ -196,7 +259,57 @@ class HITLAgent:
                 if approval.feedback:
                     self.feedback.add(step.name, step.description, approval.feedback)
                     feedback_ctx = self.feedback.as_context()
-                entry["result"] = executor(step, feedback_ctx)
+                # An executor failure on one step should be recorded, not crash
+                # the whole human-supervised workflow.
+                try:
+                    entry["result"] = executor(step, feedback_ctx)
+                except Exception as e:  # noqa: BLE001 - we surface, not swallow
+                    entry["result"] = f"ERROR: executor raised {type(e).__name__}: {e}"
+                    entry["error"] = True
+            else:
+                entry["result"] = f"SKIPPED ({approval.decision.value}): {approval.feedback}"
+
+            self.run_log.append(entry)
+            results.append(entry)
+
+            if approval.decision in (Decision.REJECT, Decision.TIMEOUT):
+                print(f"\nWorkflow halted at step '{step.name}': {approval.decision.value}")
+                break
+
+        return results
+
+    async def run_async(
+        self,
+        steps: list[Step],
+        executor: Callable[[Step, str], Awaitable[Any] | Any],
+    ) -> list[dict]:
+        """
+        Async variant of `run`. Approval uses `gate.request_async` so it never
+        blocks the event loop; the executor may be sync or a coroutine.
+        """
+        results: list[dict] = []
+        for step in steps:
+            feedback_ctx = self.feedback.as_context()
+            approval = await self.gate.request_async(step)
+
+            entry = {
+                "step": step.name,
+                "decision": approval.decision.value,
+                "feedback": approval.feedback,
+                "result": None,
+                "elapsed_approval": approval.elapsed_seconds,
+            }
+
+            if approval.approved:
+                if approval.feedback:
+                    self.feedback.add(step.name, step.description, approval.feedback)
+                    feedback_ctx = self.feedback.as_context()
+                try:
+                    out = executor(step, feedback_ctx)
+                    entry["result"] = await out if asyncio.iscoroutine(out) else out
+                except Exception as e:  # noqa: BLE001
+                    entry["result"] = f"ERROR: executor raised {type(e).__name__}: {e}"
+                    entry["error"] = True
             else:
                 entry["result"] = f"SKIPPED ({approval.decision.value}): {approval.feedback}"
 
